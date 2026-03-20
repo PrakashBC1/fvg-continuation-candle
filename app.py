@@ -403,11 +403,17 @@ def detect_fvg_launch(candles: list[dict], symbol: str, tf: str,
         if fvg["size_pct"] < min_fvg_pct:
             continue
 
-        fvg_high = fvg["fvg_high"]
-        fvg_low  = fvg["fvg_low"]
-        fvg_dir  = fvg["direction"]
-        c3_idx   = fvg["c3_idx"]
+        fvg_high  = fvg["fvg_high"]
+        fvg_low   = fvg["fvg_low"]
+        fvg_dir   = fvg["direction"]
+        c3_idx    = fvg["c3_idx"]
         fvg_range = fvg_high - fvg_low
+
+        # The structural level the close must clear:
+        #   Bullish → close must be above C3's HIGH (the candle after the gap)
+        #   Bearish → close must be below C3's LOW
+        c3_high = fvg.get("c3_high_ref", fvg_high)   # stored in find_fvgs
+        c3_low  = fvg.get("c3_low_ref",  fvg_low)    # stored in find_fvgs
 
         # Only scan candles within the lookback window that appear AFTER the FVG
         scan_start = max(c3_idx + 1, tn - lookback)
@@ -424,30 +430,28 @@ def detect_fvg_launch(candles: list[dict], symbol: str, tf: str,
             body_pct  = round(body_size / cr * 100, 1) if cr > 0 else 0
 
             if fvg_dir == "BULLISH":
-                # Mitigation touch: candle wicked INTO the FVG zone
-                # (low touched at or below FVG high — entered the gap)
-                touched_fvg = l <= fvg_high
+                # ── One end in the FVG, other end above C3.high ──────────────
+                #
+                # Condition 1 — LOW is inside the FVG zone
+                #   (the candle wicked down into the imbalance — mitigation)
+                #   l >= fvg_low  (didn't blow through the bottom of the FVG)
+                #   l <= fvg_high (actually touched inside the gap)
+                #
+                # Condition 2 — CLOSE is ABOVE C3's high
+                #   (not just above the FVG top, but above the entire C3 candle)
+                #   This is the structural break — price has cleared C3 entirely.
+                #
+                # Condition 3 — Bullish body (close > open)
+                #
+                low_in_fvg      = (fvg_low * 0.997 <= l <= fvg_high)
+                close_above_c3  = (cl > c3_high)
+                bullish_body    = (cl > o)
 
-                # Launch conditions:
-                # 1. Touched the FVG
-                # 2. Closes ABOVE FVG high (exits gap to the upside)
-                # 3. Bullish candle (close > open)
-                # 4. Did not close below FVG low (that would be a break of FVG)
-                if (touched_fvg
-                        and cl > fvg_high
-                        and cl > o
-                        and l >= fvg_low * 0.997):   # allow tiny wick below (0.3% buffer)
-
-                    # SL: below the FVG low (the imbalance is invalidated if price
-                    # closes below it)
-                    sl = fvg_low * (1 - 0.003)
-
-                    # TP1: nearest prior swing high above the launch close
+                if low_in_fvg and close_above_c3 and bullish_body:
+                    sl  = fvg_low * (1 - 0.003)           # below FVG low
                     tp1 = find_nearest_swing_high(tail, j, cl)
                     if tp1 <= cl:
                         tp1 = cl + fvg_range * 1.0
-
-                    # TP2 / TP3: Fibonacci extensions of the FVG range from the close
                     tp2 = cl + fvg_range * 1.618
                     tp3 = cl + fvg_range * 2.618
 
@@ -463,18 +467,27 @@ def detect_fvg_launch(candles: list[dict], symbol: str, tf: str,
                         rr3=calc_rr(cl, sl, tp3),
                         candle_idx=j, total_candles=tn,
                     ))
-                    break  # one launch candle per FVG — stop scanning this FVG
+                    break  # one launch candle per FVG
 
             else:  # BEARISH
-                # Mitigation touch: candle wicked UP into the FVG zone
-                touched_fvg = h >= fvg_low
+                # ── One end in the FVG, other end below C3.low ───────────────
+                #
+                # Condition 1 — HIGH is inside the FVG zone
+                #   (the candle wicked up into the imbalance — mitigation)
+                #   h >= fvg_low  (touched inside the gap)
+                #   h <= fvg_high (didn't pierce through the top of the FVG)
+                #
+                # Condition 2 — CLOSE is BELOW C3's low
+                #   (cleared the entire C3 candle to the downside — BOS)
+                #
+                # Condition 3 — Bearish body (close < open)
+                #
+                high_in_fvg    = (fvg_low <= h <= fvg_high * 1.003)
+                close_below_c3 = (cl < c3_low)
+                bearish_body   = (cl < o)
 
-                if (touched_fvg
-                        and cl < fvg_low
-                        and cl < o
-                        and h <= fvg_high * 1.003):
-
-                    sl  = fvg_high * (1 + 0.003)
+                if high_in_fvg and close_below_c3 and bearish_body:
+                    sl  = fvg_high * (1 + 0.003)          # above FVG high
                     tp1 = find_nearest_swing_low(tail, j, cl)
                     if tp1 >= cl:
                         tp1 = cl - fvg_range * 1.0
@@ -562,13 +575,13 @@ def signal_card(sig: FVGLaunch) -> str:
 
   <!-- FVG zone boundaries -->
   <div style="display:flex;gap:1.5rem;font-size:.68rem;font-family:'JetBrains Mono',monospace;
-              color:#283550;margin-bottom:.55rem;">
+              color:#283550;margin-bottom:.55rem;flex-wrap:wrap;">
     <span>FVG High <b style="color:{col};">{fp(sig.fvg_high)}</b></span>
     <span>FVG Low &nbsp;<b style="color:{col};">{fp(sig.fvg_low)}</b></span>
-    <span>Open &nbsp;&nbsp;<b style="color:#facc15;">{fp(sig.lc_open)}</b>
+    <span>LC Low &nbsp;&nbsp;<b style="color:#facc15;">{fp(sig.lc_low)}</b>
       <span style="color:#283550;font-size:.58rem;">(inside FVG)</span></span>
-    <span>Close &nbsp;&nbsp;<b style="color:{col};">{fp(sig.lc_close)}</b>
-      <span style="color:#283550;font-size:.58rem;">(beyond FVG)</span></span>
+    <span>LC Close &nbsp;<b style="color:{col};">{fp(sig.lc_close)}</b>
+      <span style="color:#283550;font-size:.58rem;">(above C3 high)</span></span>
   </div>
 
   <!-- Targets grid -->

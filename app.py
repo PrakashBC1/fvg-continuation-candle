@@ -251,81 +251,112 @@ def fetch_klines(symbol: str, interval: str, limit: int) -> list[dict] | None:
             "open":  o, "high": h, "low": l, "close": c,
             "range": h - l,
         })
+    # Always drop the last candle — it is still forming and its OHLC is not
+    # final. Scanning an unclosed candle is the single biggest source of
+    # false signals (the pattern "exists" then disappears on the next tick).
+    candles = candles[:-1]
     return candles if len(candles) >= 5 else None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FVG DETECTION
+# FVG DETECTION  — corrected orientation
 # ══════════════════════════════════════════════════════════════════════════════
 
 def find_fvgs(candles: list[dict]) -> list[dict]:
     """
-    Scan for Fair Value Gaps using the 3-candle structure:
+    Fair Value Gap — standard 3-candle definition:
 
-    Bullish FVG:
-      C1.low > C3.high  → gap between C3.high (FVG low) and C1.low (FVG high)
-      The middle candle (C2) is inside the gap
-      Requires C3 to be a bullish impulse candle (close > open)
+    BULLISH FVG  (gap left on the way UP):
+      Candle sequence: C1 → C2 (impulse up) → C3
+      Condition : C3.low > C1.high
+                  ↳ C2 was a bullish impulse so large that C3's LOW is still
+                    above C1's HIGH — the zone between C1.high and C3.low was
+                    never traded on both sides.
+      FVG zone  : low  = C1.high
+                  high = C3.low
+      C2 must be bullish (close > open) — confirms it was an impulse, not noise.
 
-    Bearish FVG:
-      C3.low > C1.high  → gap between C1.high (FVG low) and C3.low (FVG high)
-      Requires C3 to be a bearish impulse candle (close < open)
+    BEARISH FVG  (gap left on the way DOWN):
+      Condition : C1.low > C3.high
+                  ↳ C2 was a bearish impulse so large that C3's HIGH is still
+                    below C1's LOW.
+      FVG zone  : low  = C3.high
+                  high = C1.low
+      C2 must be bearish (close < open).
 
-    Returns each FVG as a dict with its boundaries and index.
+    The launch candle is a candle that LATER opens inside this zone and
+    closes back OUT of it in the direction of the original impulse, proving
+    the imbalance absorbed the pullback and price is continuing.
     """
     fvgs = []
     n = len(candles)
     for i in range(2, n):
         c1, c2, c3 = candles[i-2], candles[i-1], candles[i]
 
-        # ── Bullish FVG ──────────────────────────────────────────────────────
-        # Gap: C1.low (top) > C3.high (bottom) — price jumped up, left a gap
-        if c1["low"] > c3["high"] and c3["close"] > c3["open"]:
-            fvg_high = c1["low"]
-            fvg_low  = c3["high"]
-            if fvg_high > fvg_low:
-                gap_size = fvg_high - fvg_low
-                avg_range = (c1["range"] + c3["range"]) / 2
-                size_pct  = round(gap_size / avg_range * 100, 2) if avg_range > 0 else 0
-                fvgs.append({
-                    "direction": "BULLISH",
-                    "fvg_high":  fvg_high,
-                    "fvg_low":   fvg_low,
-                    "size_pct":  size_pct,
-                    "c3_idx":    i,          # index of the impulse candle
-                    "c1_high":   c1["high"], # structure high reference
-                    "c3_low":    c3["low"],  # structure low reference
-                })
+        # ── BULLISH FVG ───────────────────────────────────────────────────────
+        # C2 is the bullish impulse candle. Gap: C1.high (bottom) to C3.low (top).
+        if (c3["low"] > c1["high"]          # gap exists
+                and c2["close"] > c2["open"]  # C2 is bullish impulse
+                and c2["close"] > c1["high"]  # C2 actually closed above C1.high
+                and c3["low"]   > c2["open"]  # C3 did not fill back into C2
+           ):
+            fvg_low  = c1["high"]   # bottom of the untouched zone
+            fvg_high = c3["low"]    # top of the untouched zone
+            gap_size  = fvg_high - fvg_low
+            c2_range  = c2["range"] if c2["range"] > 0 else 1
+            size_pct  = round(gap_size / c2_range * 100, 2)
+            fvgs.append({
+                "direction":      "BULLISH",
+                "fvg_high":       fvg_high,
+                "fvg_low":        fvg_low,
+                "size_pct":       size_pct,
+                "impulse_idx":    i - 1,    # C2 index (the impulse candle)
+                "c3_idx":         i,        # C3 index (first candle after gap)
+                "c1_low":         c1["low"],  # structure low (SL reference)
+                "c3_high_ref":    c3["high"], # C3's high (structure context)
+            })
 
-        # ── Bearish FVG ──────────────────────────────────────────────────────
-        # Gap: C3.low (bottom) > C1.high (top) — price dropped hard, gap above
-        elif c3["low"] > c1["high"] and c3["close"] < c3["open"]:
-            fvg_high = c3["low"]
-            fvg_low  = c1["high"]
-            if fvg_high > fvg_low:
-                gap_size = fvg_high - fvg_low
-                avg_range = (c1["range"] + c3["range"]) / 2
-                size_pct  = round(gap_size / avg_range * 100, 2) if avg_range > 0 else 0
-                fvgs.append({
-                    "direction": "BEARISH",
-                    "fvg_high":  fvg_high,
-                    "fvg_low":   fvg_low,
-                    "size_pct":  size_pct,
-                    "c3_idx":    i,
-                    "c1_low":    c1["low"],  # structure low reference
-                    "c3_high":   c3["high"], # structure high reference
-                })
+        # ── BEARISH FVG ───────────────────────────────────────────────────────
+        # C2 is the bearish impulse candle. Gap: C3.high (bottom) to C1.low (top).
+        elif (c1["low"]  > c3["high"]         # gap exists
+                and c2["close"] < c2["open"]  # C2 is bearish impulse
+                and c2["close"] < c1["low"]   # C2 actually closed below C1.low
+                and c3["high"]  < c2["open"]  # C3 did not fill back into C2
+             ):
+            fvg_low  = c3["high"]   # bottom of the untouched zone
+            fvg_high = c1["low"]    # top of the untouched zone
+            gap_size  = fvg_high - fvg_low
+            c2_range  = c2["range"] if c2["range"] > 0 else 1
+            size_pct  = round(gap_size / c2_range * 100, 2)
+            fvgs.append({
+                "direction":      "BEARISH",
+                "fvg_high":       fvg_high,
+                "fvg_low":        fvg_low,
+                "size_pct":       size_pct,
+                "impulse_idx":    i - 1,
+                "c3_idx":         i,
+                "c1_high":        c1["high"],  # structure high (SL reference)
+                "c3_low_ref":     c3["low"],
+            })
     return fvgs
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAUNCH CANDLE DETECTION
+# LAUNCH CANDLE DETECTION  — corrected logic
 # ══════════════════════════════════════════════════════════════════════════════
 
-def find_swing_high(candles: list[dict], start: int, end: int) -> float:
-    return max(c["high"] for c in candles[start:end]) if start < end else 0
+def find_nearest_swing_high(candles: list[dict], from_idx: int, above: float) -> float:
+    """Return the nearest swing high above `above` looking backward from from_idx."""
+    for i in range(from_idx - 1, -1, -1):
+        if candles[i]["high"] > above:
+            return candles[i]["high"]
+    return above  # fallback
 
-def find_swing_low(candles: list[dict], start: int, end: int) -> float:
-    return min(c["low"] for c in candles[start:end]) if start < end else 999_999_999
+def find_nearest_swing_low(candles: list[dict], from_idx: int, below: float) -> float:
+    """Return the nearest swing low below `below` looking backward from from_idx."""
+    for i in range(from_idx - 1, -1, -1):
+        if candles[i]["low"] < below:
+            return candles[i]["low"]
+    return below  # fallback
 
 def calc_rr(entry: float, sl: float, tp: float) -> float:
     risk   = abs(entry - sl)
@@ -333,7 +364,6 @@ def calc_rr(entry: float, sl: float, tp: float) -> float:
     return round(reward / risk, 2) if risk > 0 else 0.0
 
 def fp(v: float) -> str:
-    """Adaptive price formatter."""
     if v <= 0:      return "—"
     if v >= 10_000: return f"{v:,.2f}"
     if v >= 1:      return f"{v:.4f}"
@@ -343,21 +373,33 @@ def fp(v: float) -> str:
 def detect_fvg_launch(candles: list[dict], symbol: str, tf: str,
                       lookback: int, min_fvg_pct: float) -> list[FVGLaunch]:
     """
-    For every FVG found in the candle history, scan subsequent candles
-    (within the lookback window) for a Launch Candle:
-      - Opens inside the FVG zone
-      - Closes beyond the FVG boundary in the direction of the FVG
-      - Has a directional body (bullish open<close, bearish open>close)
+    Two-pass scan:
+
+    Pass 1 — find all valid FVGs in the full candle history.
+
+    Pass 2 — for each FVG, scan candles that come AFTER the FVG formed
+    and look for the launch candle:
+      • The candle must have touched inside the FVG (low <= FVG.high for
+        bullish; high >= FVG.low for bearish) — this is the mitigation touch.
+      • The candle must CLOSE beyond the FVG boundary in the trade direction.
+      • The candle body must be directional (bullish close>open / bearish close<open).
+      • The open does NOT have to be inside the FVG — price can wick down into
+        the FVG and then close above FVG.high; that is still a valid launch.
+
+    Only the MOST RECENT launch candle is kept per FVG (we break after finding
+    the first one scanning backwards from the most recent candle).
     """
     results: list[FVGLaunch] = []
-    n       = len(candles)
-    tail    = candles[-(lookback + 10):]  # extra buffer for FVG formation context
-    tn      = len(tail)
+
+    # Use the last (lookback + 20) closed candles — extra context for FVG formation
+    tail = candles[-(lookback + 20):]
+    tn   = len(tail)
 
     fvgs = find_fvgs(tail)
+    if not fvgs:
+        return results
 
     for fvg in fvgs:
-        # Skip weak FVGs
         if fvg["size_pct"] < min_fvg_pct:
             continue
 
@@ -365,35 +407,54 @@ def detect_fvg_launch(candles: list[dict], symbol: str, tf: str,
         fvg_low  = fvg["fvg_low"]
         fvg_dir  = fvg["direction"]
         c3_idx   = fvg["c3_idx"]
+        fvg_range = fvg_high - fvg_low
 
-        # Scan candles AFTER the FVG formed (after c3_idx)
-        for j in range(c3_idx + 1, tn):
-            c = tail[j]
-            o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
+        # Only scan candles within the lookback window that appear AFTER the FVG
+        scan_start = max(c3_idx + 1, tn - lookback)
 
-            # Check: open inside FVG zone
-            open_in_fvg = (fvg_low <= o <= fvg_high)
-            if not open_in_fvg:
-                continue
+        for j in range(scan_start, tn):
+            c  = tail[j]
+            o  = c["open"]
+            h  = c["high"]
+            l  = c["low"]
+            cl = c["close"]
+            cr = c["range"]
 
-            body_size  = abs(cl - o)
-            candle_rng = h - l
-            body_pct   = round(body_size / candle_rng * 100, 1) if candle_rng > 0 else 0
+            body_size = abs(cl - o)
+            body_pct  = round(body_size / cr * 100, 1) if cr > 0 else 0
 
             if fvg_dir == "BULLISH":
-                # Close above FVG high + bullish body
-                if cl > fvg_high and cl > o:
-                    fvg_range = fvg_high - fvg_low
-                    sl  = fvg_low  * (1 - 0.003)   # 0.3% below FVG low
-                    tp1 = find_swing_high(tail, c3_idx, j)   # nearest prior swing high above
+                # Mitigation touch: candle wicked INTO the FVG zone
+                # (low touched at or below FVG high — entered the gap)
+                touched_fvg = l <= fvg_high
+
+                # Launch conditions:
+                # 1. Touched the FVG
+                # 2. Closes ABOVE FVG high (exits gap to the upside)
+                # 3. Bullish candle (close > open)
+                # 4. Did not close below FVG low (that would be a break of FVG)
+                if (touched_fvg
+                        and cl > fvg_high
+                        and cl > o
+                        and l >= fvg_low * 0.997):   # allow tiny wick below (0.3% buffer)
+
+                    # SL: below the FVG low (the imbalance is invalidated if price
+                    # closes below it)
+                    sl = fvg_low * (1 - 0.003)
+
+                    # TP1: nearest prior swing high above the launch close
+                    tp1 = find_nearest_swing_high(tail, j, cl)
                     if tp1 <= cl:
                         tp1 = cl + fvg_range * 1.0
-                    tp2 = cl + fvg_range * 1.618   # Fib extension
-                    tp3 = cl + fvg_range * 2.618   # Runner
+
+                    # TP2 / TP3: Fibonacci extensions of the FVG range from the close
+                    tp2 = cl + fvg_range * 1.618
+                    tp3 = cl + fvg_range * 2.618
 
                     results.append(FVGLaunch(
                         direction="BULLISH", symbol=symbol, tf=tf, dt=c["dt"],
-                        fvg_high=fvg_high, fvg_low=fvg_low, fvg_size_pct=fvg["size_pct"],
+                        fvg_high=fvg_high, fvg_low=fvg_low,
+                        fvg_size_pct=fvg["size_pct"],
                         lc_open=o, lc_high=h, lc_low=l, lc_close=cl,
                         lc_body_pct=body_pct,
                         sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
@@ -402,14 +463,19 @@ def detect_fvg_launch(candles: list[dict], symbol: str, tf: str,
                         rr3=calc_rr(cl, sl, tp3),
                         candle_idx=j, total_candles=tn,
                     ))
-                    break  # one launch candle per FVG
+                    break  # one launch candle per FVG — stop scanning this FVG
 
             else:  # BEARISH
-                # Close below FVG low + bearish body
-                if cl < fvg_low and cl < o:
-                    fvg_range = fvg_high - fvg_low
+                # Mitigation touch: candle wicked UP into the FVG zone
+                touched_fvg = h >= fvg_low
+
+                if (touched_fvg
+                        and cl < fvg_low
+                        and cl < o
+                        and h <= fvg_high * 1.003):
+
                     sl  = fvg_high * (1 + 0.003)
-                    tp1 = find_swing_low(tail, c3_idx, j)
+                    tp1 = find_nearest_swing_low(tail, j, cl)
                     if tp1 >= cl:
                         tp1 = cl - fvg_range * 1.0
                     tp2 = cl - fvg_range * 1.618
@@ -417,7 +483,8 @@ def detect_fvg_launch(candles: list[dict], symbol: str, tf: str,
 
                     results.append(FVGLaunch(
                         direction="BEARISH", symbol=symbol, tf=tf, dt=c["dt"],
-                        fvg_high=fvg_high, fvg_low=fvg_low, fvg_size_pct=fvg["size_pct"],
+                        fvg_high=fvg_high, fvg_low=fvg_low,
+                        fvg_size_pct=fvg["size_pct"],
                         lc_open=o, lc_high=h, lc_low=l, lc_close=cl,
                         lc_body_pct=body_pct,
                         sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
